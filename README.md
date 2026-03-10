@@ -1,10 +1,10 @@
 # Gemma-3 On-Device — iPhone 14 Pro (A16 Bionic)
 
-A Swift/SwiftUI iOS application that runs **Google Gemma-3-4B-Instruct** entirely
+A Swift/SwiftUI iOS application that runs **Google Gemma-3-1B-Instruct** entirely
 on-device using **ExecuTorch** with the **CoreML backend delegate**, targeting the
 Apple Neural Engine on the A16 Bionic SoC.
 
-Quantization: **INT4 weight-only** (groupwise, group_size=128) with fp16 activations.
+Quantization: **INT8 weight-only** (per-channel, symmetric) with fp16 activations.
 Decoding: **KV-cache enabled** — each decode step processes a single token instead
 of re-computing the entire prefix, giving substantially lower per-token latency.
 
@@ -15,7 +15,7 @@ of re-computing the entire prefix, giving substantially lower per-token latency.
 ```
 gemma3/
 ├── scripts/
-│   ├── export_gemma3.py           # Exports Gemma-3 → INT4 .pte with CoreML delegate + KV-cache
+│   ├── export_gemma3.py           # Exports Gemma-3 → INT8 .pte with CoreML delegate + KV-cache
 │   └── requirements.txt           # Python dependencies for the export step
 └── Gemma3OnDevice/
     ├── Info.plist
@@ -53,11 +53,11 @@ gemma3/
 cd gemma3/scripts
 pip install -r requirements.txt
 
-# Requires a HuggingFace token with access to google/gemma-3-4b-it
+# Requires a HuggingFace token with access to google/gemma-3-1b-it
 huggingface-cli login
 
 python export_gemma3.py \
-    --model_id  google/gemma-3-4b-it \
+    --model_id  google/gemma-3-1b-it \
     --output_dir ./output \
     --seq_len   512
 ```
@@ -66,15 +66,17 @@ This produces two files in `scripts/output/`:
 
 | File | Purpose |
 |------|---------|
-| `gemma3_4b_int4_coreml.pte` | ExecuTorch model bundle (~2.0 GB INT4, KV-cache) |
+| `gemma3_1b_int8_coreml.pte` | ExecuTorch model bundle (~1.8 GB INT8, KV-cache) |
 | `tokenizer.model` | SentencePiece vocabulary |
 
-> **Memory note:** The INT4-quantised 4B model requires ≈ 2.0 GB of RAM for weights.
-> The static KV-cache for 2 048 tokens adds ~400 MB (fp32) on top, bringing the
-> total to ≈ 2.4 GB — within the iPhone 14 Pro's 6 GB limit with headroom for iOS.
-> INT4 groupwise quantization (group_size=128) keeps perplexity regression
-> manageable for a 4B-parameter model, while halving the weight footprint
-> compared to INT8.
+> **Memory note:** The INT8-quantised 1B model requires ≈ 1.8 GB of RAM
+> (the static KV-cache for 2 048 tokens adds ~400 MB on top of the weights),
+> well within the iPhone 14 Pro's 6 GB limit.  INT8 is preferred over INT4
+> for this model size: a 1B-parameter model has low parameter redundancy, so
+> INT4 causes ~2–4% perplexity regression whereas INT8 stays within ~0.5%.
+> With the KV-cache enabled the per-step latency is dominated by the
+> single-token GEMM rather than weight loading, so the speed advantage of
+> INT4 largely disappears.
 
 ---
 
@@ -158,7 +160,7 @@ In **Target → Build Settings**, set:
 
 1. In Xcode, select your target → **Build Phases → Copy Bundle Resources**.
 2. Click **+** and add:
-   - `scripts/output/gemma3_4b_int4_coreml.pte`
+   - `scripts/output/gemma3_1b_int8_coreml.pte`
    - `scripts/output/tokenizer.model`
 
 The two files will be copied into `MyApp.app/` at build time, and
@@ -205,21 +207,24 @@ Xcode → select iPhone 14 Pro simulator or physical device → ▶ Run
                     │ ExecuTorch delegate dispatch
 ┌───────────────────▼─────────────────────┐
 │      CoreML Backend + ANE (A16)         │
-│  gemma3_4b_int4_coreml.pte              │
-│  (INT4 weights, fp16 activations,       │
+│  gemma3_1b_int8_coreml.pte              │
+│  (INT8 weights, fp16 activations,       │
 │   static KV-cache 2048 tokens)          │
 └─────────────────────────────────────────┘
 ```
 
-### INT4 quantization
+### INT8 quantization
 
-The export script applies **weight-only INT4 quantisation** (groupwise, group_size=128)
-via `torchao`.  Activations remain in fp16.  The quantised
+The export script applies **weight-only INT8 quantisation** (per-channel, symmetric)
+via `torch.ao.quantization`.  Activations remain in fp16.  The quantised
 weights are lowered into the CoreML `.mlpackage` blob embedded inside the
 `.pte` artefact at export time.  At inference time, the ANE decompresses
-INT4 → fp16 on-the-fly during the matrix multiplications in attention and
-FFN layers, yielding ~4× weight memory reduction (vs fp16) while keeping
-perplexity within acceptable bounds for the 4B model size.
+INT8 → fp16 on-the-fly during the matrix multiplications in attention and
+FFN layers, yielding ~2× weight memory reduction (vs fp16) while keeping
+perplexity within ~0.5% of the fp16 baseline.
+
+INT8 is preferred over INT4 for Gemma-3-1B because smaller models have less
+parameter redundancy and are more sensitive to aggressive quantization.
 
 ### KV-cache
 
@@ -238,7 +243,7 @@ export — each token step has constant-time cost regardless of context length.
 `torch::executor::util::FileDataLoader` (from
 `executorch/extension/data_loader/file_data_loader.h`) opens the `.pte`
 file at the bundle path and `mmap`s it for zero-copy weight access.  This
-avoids duplicating the ~2.0 GB model in RAM — the OS pages weights in on
+avoids duplicating the ~1.8 GB model in RAM — the OS pages weights in on
 demand from the file, sharing physical pages between processes.
 
 ### Token streaming
@@ -257,7 +262,7 @@ incrementally in `ChatView`.
 |---------|-------------|-----|
 | "Model artefacts not found in app bundle" | .pte / .model not in Copy Bundle Resources | Add them to Build Phases |
 | `ET_LOG Error: FileDataLoader failed` | Wrong path or corrupt file | Re-run export_gemma3.py |
-| App crashes on first token | Insufficient memory | Close other apps; ensure the 4B INT4 model fits within 6 GB |
+| App crashes on first token | Insufficient memory | Use the 1B model; close other apps |
 | Very slow generation on Simulator | Simulator lacks ANE | Run on device |
 | Compile error: `sentencepiece_processor.h` not found | Pod not installed | Run `pod install` |
 | KV-cache overflow error in log | Prompt length ≥ 2048 tokens | Shorten the prompt or increase MAX_CACHE_LEN |

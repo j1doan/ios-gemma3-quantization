@@ -78,13 +78,13 @@ final class ChatViewModel: ObservableObject {
         // Resolve bundle paths on the calling (main) thread before hopping off
         guard
             let modelURL = Bundle.main.url(
-                forResource: "gemma3_4b_int4_coreml", withExtension: "pte"),
+                forResource: "gemma3_1b_int8_coreml", withExtension: "pte"),
             let tokenizerURL = Bundle.main.url(
                 forResource: "tokenizer", withExtension: "model")
         else {
             modelState = .failed(reason:
                 "Model artefacts not found in app bundle.\n" +
-                "Add gemma3_4b_int4_coreml.pte and tokenizer.model " +
+                "Add gemma3_1b_int8_coreml.pte and tokenizer.model " +
                 "to the Xcode project under 'Copy Bundle Resources'.")
             return
         }

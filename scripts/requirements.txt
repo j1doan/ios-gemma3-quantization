@@ -5,10 +5,8 @@ torch==2.5.0
 executorch>=0.4.0
 # transformers 4.49+ is required for Gemma3ForCausalLM (Gemma-3 architecture).
 # 4.46 and earlier only know GemmaForCausalLM (Gemma 1/2) and will reject
-# the google/gemma-3-4b-it checkpoint.
+# the google/gemma-3-1b-it checkpoint.
 transformers>=4.49.0
 sentencepiece==0.2.0
 huggingface_hub>=0.26.0
 coremltools>=7.2
-# torchao provides INT4 weight-only quantization used by the export script.
-torchao>=0.4.0

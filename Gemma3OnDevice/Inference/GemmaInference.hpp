@@ -76,7 +76,7 @@ public:
     /// Internally creates a torch::executor::util::FileDataLoader for the
     /// .pte file and initialises the ExecuTorch Method.
     ///
-    /// @param model_path      Absolute path to gemma3_4b_int4_coreml.pte
+    /// @param model_path      Absolute path to gemma3_1b_int8_coreml.pte
     /// @param tokenizer_path  Absolute path to tokenizer.model (SentencePiece)
     /// @return true on success; logs an ET_LOG(Error, …) on failure
     bool load(const std::string& model_path,

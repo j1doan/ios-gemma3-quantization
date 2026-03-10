@@ -82,7 +82,7 @@ struct GemmaInference::Impl {
     std::unique_ptr<GemmaTokenizer> tokenizer;
 
     bool loaded     = false;
-    int  vocab_size = 262144;  // Gemma-3 default; overridden after load
+    int  vocab_size = 256000;  // Gemma-3 default; overridden after load
 
     // ---- Sampling ----------------------------------------------------------
     std::mt19937 rng{std::random_device{}()};
@@ -455,7 +455,7 @@ int32_t GemmaInference::sampleFiltered(std::vector<std::pair<float, int>>& cands
 std::string GemmaInference::modelInfo() const {
     if (!impl_->loaded) return "Model not loaded";
     std::ostringstream oss;
-    oss << "Gemma-3-4B-Instruct (INT4, CoreML, StaticCache)"
+    oss << "Gemma-3-1B-Instruct (INT8, CoreML, StaticCache)"
         << " | vocab=" << impl_->vocab_size;
     return oss.str();
 }

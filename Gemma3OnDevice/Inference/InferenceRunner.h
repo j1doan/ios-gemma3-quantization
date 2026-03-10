@@ -56,7 +56,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Load the model artefacts synchronously.
 ///
-/// @param modelPath      Absolute path to gemma3_4b_int4_coreml.pte
+/// @param modelPath      Absolute path to gemma3_1b_int8_coreml.pte
 /// @param tokenizerPath  Absolute path to tokenizer.model
 /// @param error          Populated on failure with a descriptive string
 /// @return YES if the model loaded successfully.
