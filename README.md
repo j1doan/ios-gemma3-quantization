@@ -8,6 +8,12 @@ Quantization: **INT4 weight-only** (groupwise, group_size=128) with fp16 activat
 Decoding: **KV-cache enabled** — each decode step processes a single token instead
 of re-computing the entire prefix, giving substantially lower per-token latency.
 
+**Multimodal support:** The app can optionally load a SigLIP vision encoder
+(`.pte`) alongside the text decoder, enabling image+text prompts. The vision
+encoder runs at fp16 and produces ~256 projected tokens that are injected into
+the decoder via an AOT-compatible embedding-mask blend — no dynamic control
+flow required.
+
 ---
 
 ## Project layout
@@ -23,12 +29,13 @@ gemma3/
     ├── App/
     │   └── Gemma3OnDeviceApp.swift        # @main SwiftUI entry point
     ├── Views/
-    │   └── ChatView.swift                 # SwiftUI chat interface
+    │   └── ChatView.swift                 # SwiftUI chat interface + PhotosPicker
     ├── ViewModels/
     │   └── ChatViewModel.swift            # @MainActor observable ViewModel
     └── Inference/
         ├── GemmaInference.hpp / .cpp      # C++ inference engine (ExecuTorch)
         ├── Tokenizer.hpp / .cpp           # SentencePiece tokenizer wrapper
+        ├── ImagePreprocessor.swift         # Resize / normalize images for SigLIP (CPU-side)
         ├── InferenceRunner.h              # Objective-C++ class declaration
         └── InferenceRunner.mm             # Objective-C++ implementation
 ```
@@ -48,6 +55,8 @@ gemma3/
 ---
 
 ## Step 1 — Export the model
+
+### Text-only (default)
 
 ```bash
 cd gemma3/scripts
@@ -69,12 +78,40 @@ This produces two files in `scripts/output/`:
 | `gemma3_4b_int4_coreml.pte` | ExecuTorch model bundle (~2.0 GB INT4, KV-cache) |
 | `tokenizer.model` | SentencePiece vocabulary |
 
+### Multimodal (text + vision)
+
+```bash
+python export_gemma3.py \
+    --model_id  google/gemma-3-4b-it \
+    --output_dir ./output \
+    --seq_len   512 \
+    --multimodal
+```
+
+This produces three files in `scripts/output/`:
+
+| File | Purpose |
+|------|---------|
+| `gemma3_4b_int4_coreml.pte` | Text decoder with 4-input embed-mask signature (~2.0 GB INT4) |
+| `gemma3_vision_encoder.pte` | SigLIP vision encoder + projector (fp16, ~350 MB) |
+| `tokenizer.model` | SentencePiece vocabulary |
+
+The multimodal text decoder accepts four inputs per step:
+`(input_ids, cache_position, inputs_embeds, embed_mask)`.
+During normal text decode `embed_mask=0` and the extra inputs are ignored.
+During vision-token prefill `embed_mask=1` and `inputs_embeds` carries the
+projected vision embedding, blended via
+`combined = embed_mask * inputs_embeds + (1 - embed_mask) * token_embeds`
+— pure tensor arithmetic with static shapes (AOT-safe).
+
 > **Memory note:** The INT4-quantised 4B model requires ≈ 2.0 GB of RAM for weights.
 > The static KV-cache for 2 048 tokens adds ~272 MB (fp16) on top, bringing the
 > total to ≈ 2.3 GB — within the A16 Bionic's 6 GB unified memory limit with headroom for iOS.
 > INT4 groupwise quantization (group_size=128) keeps perplexity regression
 > manageable for a 4B-parameter model, while halving the weight footprint
 > compared to INT8.
+> With the vision encoder loaded (~350 MB fp16), total memory rises to ≈ 2.6 GB
+> — still within the 6 GB budget.
 
 ---
 
@@ -160,10 +197,12 @@ In **Target → Build Settings**, set:
 2. Click **+** and add:
    - `scripts/output/gemma3_4b_int4_coreml.pte`
    - `scripts/output/tokenizer.model`
+   - (multimodal only) `scripts/output/gemma3_vision_encoder.pte`
 
-The two files will be copied into `MyApp.app/` at build time, and
+The files will be copied into `MyApp.app/` at build time, and
 `Bundle.main.url(forResource:withExtension:)` in `ChatViewModel.swift`
-will locate them at runtime.
+will locate them at runtime. When the vision encoder `.pte` is present in
+the bundle, the app automatically enables image+text mode.
 
 ---
 
@@ -185,7 +224,7 @@ Xcode → select a physical A16 Bionic device or Simulator → ▶ Run
 ┌─────────────────────────────────────────┐
 │             SwiftUI Layer               │
 │  ChatView  ←→  ChatViewModel            │
-│               (@MainActor, Combine)     │
+│  (PhotosPicker, @MainActor, Combine)    │
 └───────────────────┬─────────────────────┘
                     │ Obj-C bridge (main thread dispatch)
 ┌───────────────────▼─────────────────────┐
@@ -193,6 +232,7 @@ Xcode → select a physical A16 Bionic device or Simulator → ▶ Run
 │  • GemmaGenerationConfig (ObjC mirror)  │
 │  • dispatch_queue (serial, QoS=UI)      │
 │  • cancelRequested (std::atomic<bool>)  │
+│  • generateFromPrompt:pixelData: (img)  │
 └───────────────────┬─────────────────────┘
                     │ C++ call
 ┌───────────────────▼─────────────────────┐
@@ -201,15 +241,34 @@ Xcode → select a physical A16 Bionic device or Simulator → ▶ Run
 │  • Program / Method  (ExecuTorch RT)    │
 │  • GemmaTokenizer  (SentencePiece)      │
 │  • Token sampling  (temp / top-p / k)   │
+│  ─── multimodal (optional) ──────────── │
+│  • Vision encoder .pte  (SigLIP fp16)   │
+│  • generateWithImage()  → vision prefill│
+│  • runVisionEncoder()   → [1,256,3072]  │
 └───────────────────┬─────────────────────┘
                     │ ExecuTorch delegate dispatch
 ┌───────────────────▼─────────────────────┐
 │      CoreML Backend + ANE (A16)         │
 │  gemma3_4b_int4_coreml.pte              │
+│  gemma3_vision_encoder.pte (optional)   │
 │  (INT4 weights, fp16 activations,       │
 │   static KV-cache 2048 tokens)          │
 └─────────────────────────────────────────┘
 ```
+
+### Multimodal inference flow
+
+When the user attaches an image:
+
+1. **ImagePreprocessor.swift** resizes to 896×896, normalises with SigLIP constants
+   (mean=0.5, std=0.5), and produces a Float32 CHW buffer `[3, 896, 896]`.
+2. The buffer is passed through the ObjC bridge to `GemmaInference::generateWithImage()`.
+3. `runVisionEncoder()` runs the vision `.pte` on the pixel buffer →
+   projected tokens `[1, 256, 3072]` (fp16).
+4. During prefill the first 256 decode steps set `embed_mask=1.0` and inject
+   the vision embeddings. The remaining prompt tokens use `embed_mask=0.0`
+   (normal token-embedding lookup).
+5. Autoregressive decode continues identically to text-only mode.
 
 ### INT4 quantization
 
@@ -233,6 +292,15 @@ passed in or out by the C++ layer; only logits are read from the output.
 
 This eliminates the O(N²) full-prefix recomputation of the original stateless
 export — each token step has constant-time cost regardless of context length.
+
+> **Circular wrapping note:** The spec describes `cache_index = position % max_seq`
+> for circular buffer behaviour.  In practice, true circular wrapping would
+> introduce RoPE-position discontinuities at the wrap boundary (e.g. query at
+> wrapped-position 1 attending to key at wrapped-position 2047 would compute a
+> relative distance of −2046 instead of the true distance of 2).  Since the
+> sliding-window size (2048) equals the cache size, linear fill with per-turn
+> reset provides identical memory and context guarantees without the position
+> aliasing problem.  The cache is reset between conversation turns.
 
 ### FileDataLoader
 
@@ -262,6 +330,8 @@ incrementally in `ChatView`.
 | Very slow generation on Simulator | Simulator lacks ANE | Run on device |
 | Compile error: `sentencepiece_processor.h` not found | Pod not installed | Run `pod install` |
 | KV-cache overflow error in log | Prompt length ≥ 2048 tokens | Shorten the prompt or increase MAX_CACHE_LEN |
+| Image button missing in chat | Vision encoder .pte not in bundle | Add `gemma3_vision_encoder.pte` to Copy Bundle Resources, or re-export with `--multimodal` |
+| Vision encoder load failure | Mismatched export | Re-export with `--multimodal` flag; ensure both .pte files come from the same export run |
 
 ---
 

@@ -1,6 +1,7 @@
 // ChatView.swift
 // SwiftUI chat interface for on-device Gemma-3 inference.
 
+import PhotosUI
 import SwiftUI
 
 // ---------------------------------------------------------------------------
@@ -10,6 +11,8 @@ import SwiftUI
 struct ChatView: View {
     @StateObject private var viewModel = ChatViewModel()
     @State private var inputText: String = ""
+    @State private var selectedImage: UIImage?
+    @State private var photoPickerItem: PhotosPickerItem?
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -57,6 +60,8 @@ struct ChatView: View {
                 InputBar(
                     text: $inputText,
                     isFocused: $inputFocused,
+                    selectedImage: $selectedImage,
+                    photoPickerItem: $photoPickerItem,
                     isGenerating: viewModel.modelState == .generating,
                     isModelReady: {
                         if case .ready = viewModel.modelState { return true }
@@ -64,8 +69,10 @@ struct ChatView: View {
                     }(),
                     onSend: {
                         let text = inputText
+                        let image = selectedImage
                         inputText = ""
-                        viewModel.sendMessage(text)
+                        selectedImage = nil
+                        viewModel.sendMessage(text, image: image)
                     },
                     onCancel: {
                         viewModel.cancelGeneration()
@@ -164,6 +171,15 @@ private struct MessageBubble: View {
 
             VStack(alignment: message.role == .user ? .trailing : .leading,
                    spacing: 2) {
+                // Image attachment (user messages only)
+                if let img = message.image {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 200, maxHeight: 200)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+
                 Text(message.text.isEmpty && message.isStreaming ? "▋" : message.text)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
@@ -267,46 +283,88 @@ private struct BubbleShape: Shape {
 private struct InputBar: View {
     @Binding var text: String
     var isFocused: FocusState<Bool>.Binding
+    @Binding var selectedImage: UIImage?
+    @Binding var photoPickerItem: PhotosPickerItem?
     let isGenerating: Bool
     let isModelReady: Bool
     let onSend: () -> Void
     let onCancel: () -> Void
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            // Text field
-            TextField("Message", text: $text, axis: .vertical)
-                .lineLimit(1...6)
+        VStack(spacing: 6) {
+            // Image preview strip
+            if let img = selectedImage {
+                HStack {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(height: 60)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    Button {
+                        selectedImage = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 20))
-                .focused(isFocused)
+            }
+
+            HStack(alignment: .bottom, spacing: 10) {
+                // Photo picker
+                PhotosPicker(selection: $photoPickerItem,
+                             matching: .images) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.blue)
+                }
                 .disabled(isGenerating)
-                .onSubmit {
-                    if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        onSend()
+                .onChange(of: photoPickerItem) {
+                    Task {
+                        if let data = try? await photoPickerItem?.loadTransferable(
+                            type: Data.self),
+                           let uiImage = UIImage(data: data) {
+                            selectedImage = uiImage
+                        }
+                        photoPickerItem = nil
                     }
                 }
 
-            // Send / Cancel button
-            if isGenerating {
-                Button(action: onCancel) {
-                    Image(systemName: "stop.circle.fill")
-                        .font(.system(size: 30))
-                        .foregroundStyle(.red)
+                // Text field
+                TextField("Message", text: $text, axis: .vertical)
+                    .lineLimit(1...6)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 20))
+                    .focused(isFocused)
+                    .disabled(isGenerating)
+                    .onSubmit {
+                        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            onSend()
+                        }
+                    }
+
+                // Send / Cancel button
+                if isGenerating {
+                    Button(action: onCancel) {
+                        Image(systemName: "stop.circle.fill")
+                            .font(.system(size: 30))
+                            .foregroundStyle(.red)
+                    }
+                } else {
+                    Button(action: onSend) {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 30))
+                            .foregroundStyle(canSend ? Color.blue : Color.gray.opacity(0.4))
+                    }
+                    .disabled(!canSend)
                 }
-            } else {
-                Button(action: onSend) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 30))
-                        .foregroundStyle(canSend ? Color.blue : Color.gray.opacity(0.4))
-                }
-                .disabled(!canSend)
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
         .background(Color(.systemBackground))
     }
 

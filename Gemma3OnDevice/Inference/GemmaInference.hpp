@@ -1,17 +1,28 @@
 // GemmaInference.hpp
 // Core C++ inference engine — ExecuTorch runtime + CoreML backend delegate
 //
-// Model forward signature (StaticCache):
+// Model forward signature (StaticCache, text-only 2-input):
 //   inputs:  input_ids [1,1] int64,
 //            cache_position [1] int64
 //   outputs: logits [1,1,vocab_size] float32
-//   KV-cache is mutable module state in the .pte bundle; no explicit KV
-//   tensors are passed in or out by the C++ layer.
+//
+// Model forward signature (multimodal 4-input, exported with --multimodal):
+//   inputs:  input_ids [1,1] int64,
+//            cache_position [1] int64,
+//            inputs_embeds [1,1,hidden_dim] float16,
+//            embed_mask    [1,1,1] float16
+//   outputs: logits [1,1,vocab_size] float32
+//
+// KV-cache is mutable module state in the .pte bundle; no explicit KV
+// tensors are passed in or out by the C++ layer.
+//
+// When a vision encoder .pte is loaded (multimodal mode), images are:
+//   1. Preprocessed to [1,3,896,896] on the Swift side
+//   2. Passed through the vision encoder .pte → [1,256,3072] projected tokens
+//   3. Injected into the decoder during prefill via embed_mask=1.0
 //
 // Prefill reuses the same exported decode-step graph by running it once per
-// prompt token (or a single call with seq_len == prompt_len if the export
-// supports a prefill-length input — the default export traces at seq_len=1
-// for decode, so prefill is handled by iterating over prompt tokens).
+// prompt token (or vision embedding during image prefill).
 //
 // This class is NOT thread-safe — concurrency is managed at the ObjC layer.
 
@@ -23,6 +34,15 @@
 #include <vector>
 
 namespace gemma {
+
+// ---------------------------------------------------------------------------
+// Architecture constants (Section 1 of edge spec)
+// ---------------------------------------------------------------------------
+
+static constexpr int kHiddenDim     = 3072;
+static constexpr int kNImageTokens  = 256;   // projected vision tokens per image
+static constexpr int kVisionInputH  = 896;
+static constexpr int kVisionInputW  = 896;
 
 // ---------------------------------------------------------------------------
 // Generation configuration
@@ -73,74 +93,80 @@ public:
 
     /// Load model artefacts from the app bundle.
     ///
-    /// Internally creates a torch::executor::util::FileDataLoader for the
-    /// .pte file and initialises the ExecuTorch Method.
-    ///
-    /// @param model_path      Absolute path to gemma3_4b_int4_coreml.pte
-    /// @param tokenizer_path  Absolute path to tokenizer.model (SentencePiece)
-    /// @return true on success; logs an ET_LOG(Error, …) on failure
+    /// @param model_path           Absolute path to gemma3_4b_int4_coreml.pte
+    /// @param tokenizer_path       Absolute path to tokenizer.model (SentencePiece)
+    /// @param vision_encoder_path  Absolute path to gemma3_vision_encoder.pte
+    ///                             (empty string to skip — text-only mode)
+    /// @return true on success
     bool load(const std::string& model_path,
-              const std::string& tokenizer_path);
+              const std::string& tokenizer_path,
+              const std::string& vision_encoder_path = "");
 
-    /// Run autoregressive text generation.
-    ///
-    /// Formats the prompt using the Gemma-3 instruct template, runs prefill,
-    /// then calls the decode loop until EOS or max_new_tokens is reached.
-    /// Each decoded token fragment is delivered via @p callback on the calling
-    /// thread (synchronous — the caller should dispatch onto a background
-    /// thread if needed).
-    ///
-    /// @param prompt   Raw user text (will be wrapped in Gemma chat template)
-    /// @param config   Sampling and length configuration
-    /// @param callback Streaming token callback
-    void generate(const std::string&   prompt,
+    /// Run autoregressive text generation (text-only prompt).
+    void generate(const std::string&      prompt,
                   const GenerationConfig& config,
                   TokenCallback           callback);
 
-    /// Returns true once load() has succeeded.
+    /// Run autoregressive generation with an image.
+    /// @param prompt         Raw user text
+    /// @param pixel_data     Pre-processed pixel buffer [1,3,896,896] as float32
+    ///                       (C-contiguous, CHW layout).  Must contain exactly
+    ///                       3 * 896 * 896 floats.
+    /// @param config         Sampling configuration
+    /// @param callback       Streaming token callback
+    void generateWithImage(const std::string&      prompt,
+                           const float*            pixel_data,
+                           const GenerationConfig& config,
+                           TokenCallback           callback);
+
     bool isLoaded() const noexcept;
 
-    /// Human-readable summary of the loaded model (vocab size, seq len, …).
-    std::string modelInfo() const;
+    /// True when a vision encoder .pte was loaded successfully.
+    bool isMultimodal() const noexcept;
 
-    /// Signal the running generate() call to stop at the next token boundary.
-    /// Safe to call from any thread.  Automatically cleared at the start of
-    /// the next generate() call.
+    std::string modelInfo() const;
     void requestCancel() noexcept;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 
-    // ---- helpers ----
-
-    /// Reset the position pointer to 0 so the next generate() call
-    /// overwrites cache entries from the beginning.
     void resetKVCache();
 
-    /// Run one forward step through the ExecuTorch method.
+    /// Run one text-decoder forward step.
+    /// Adapts automatically to the 2-input (text-only) or 4-input (multimodal)
+    /// model signature detected at load time.
     ///
-    /// Sets input_ids and cache_position, executes "forward", and copies
-    /// the output logits into out_logits.  KV-cache state is updated
-    /// in-place inside the .pte method (StaticCache); no explicit KV
-    /// tensors are passed or returned.
-    ///
-    /// @param token_id      The single token to process this step.
-    /// @param cache_pos     Absolute position in the KV-cache for this step.
-    /// @param out_logits    Pointer to the impl_->logit_scratch buffer.
-    /// @return Error::Ok on success.
+    /// @param token_id       Token ID for this step (ignored when embed_data != nullptr)
+    /// @param cache_pos      Absolute position in the KV-cache
+    /// @param embed_data     If non-null, pointer to a [hidden_dim] float16 embedding
+    ///                       to inject instead of looking up token_id
+    /// @param out_logits     Output buffer (vocab_size floats)
     torch::executor::Error runStep(int32_t token_id,
                                    int32_t cache_pos,
+                                   const void* embed_data,
                                    float*  out_logits);
 
-    /// Sample one token ID from a raw logit vector.
+    /// Run the vision encoder .pte on pre-processed pixel data.
+    /// @param pixel_data  [1,3,896,896] float32 buffer  (3*896*896 floats)
+    /// @param out_embeds  Output buffer: n_image_tokens * hidden_dim float16 values
+    /// @return true on success
+    bool runVisionEncoder(const float* pixel_data,
+                          void*        out_embeds);
+
     int32_t sampleToken(const float* logits, int vocab_size,
                         const GenerationConfig& config);
-
-    /// Apply temperature scaling, top-k filter, and top-p nucleus filter,
-    /// then sample from the resulting distribution.
     int32_t sampleFiltered(std::vector<std::pair<float,int>>& candidates,
                            float temperature, float top_p);
+
+    /// Shared autoregressive decode loop used by both generate() and
+    /// generateWithImage() after prefill is complete.
+    void decodeLoop(float* logit_buf,
+                    const GenerationConfig& config,
+                    TokenCallback callback);
+
+    /// Load the vision encoder .pte file.
+    bool loadVisionEncoder(const std::string& path);
 };
 
 } // namespace gemma

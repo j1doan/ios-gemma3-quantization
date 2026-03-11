@@ -4,6 +4,7 @@
 
 import Combine
 import Foundation
+import UIKit
 
 // ---------------------------------------------------------------------------
 // Domain model
@@ -18,13 +19,21 @@ struct ChatMessage: Identifiable, Equatable {
     let id: UUID
     var role: MessageRole
     var text: String
+    var image: UIImage?
     var isStreaming: Bool
 
-    init(role: MessageRole, text: String, isStreaming: Bool = false) {
+    init(role: MessageRole, text: String, image: UIImage? = nil,
+         isStreaming: Bool = false) {
         self.id = UUID()
         self.role = role
         self.text = text
+        self.image = image
         self.isStreaming = isStreaming
+    }
+
+    static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool {
+        lhs.id == rhs.id && lhs.role == rhs.role &&
+        lhs.text == rhs.text && lhs.isStreaming == rhs.isStreaming
     }
 }
 
@@ -89,17 +98,23 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
+        // Vision encoder is optional — present only for multimodal builds
+        let visionURL = Bundle.main.url(
+            forResource: "gemma3_vision_encoder", withExtension: "pte")
+
         // Heavy I/O + memory-map on a background thread
         let modelPath     = modelURL.path
         let tokenizerPath = tokenizerURL.path
+        let visionPath    = visionURL?.path
         let runner        = self.runner
 
         let result = await Task.detached(priority: .userInitiated) {
             () -> Result<String, Error> in
             do {
-                // Swift bridges ObjC `(BOOL)method:(NSError **)error` as a
-                // throwing function — the `error:` label is dropped.
-                try runner.loadModel(atPath: modelPath, tokenizerPath: tokenizerPath)
+                try runner.loadModel(
+                    atPath: modelPath,
+                    tokenizerPath: tokenizerPath,
+                    visionEncoderPath: visionPath)
                 return .success(runner.modelInfo ?? "Gemma-3 ready")
             } catch {
                 return .failure(error)
@@ -116,13 +131,13 @@ final class ChatViewModel: ObservableObject {
 
     // ---- Chat send --------------------------------------------------------
 
-    func sendMessage(_ text: String) {
+    func sendMessage(_ text: String, image: UIImage? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard case .ready = modelState else { return }
 
-        // Append user bubble
-        messages.append(ChatMessage(role: .user, text: trimmed))
+        // Append user bubble (with optional image)
+        messages.append(ChatMessage(role: .user, text: trimmed, image: image))
 
         // Append empty assistant bubble (streamed into)
         let assistantMsg = ChatMessage(role: .assistant, text: "", isStreaming: true)
@@ -132,29 +147,57 @@ final class ChatViewModel: ObservableObject {
         modelState = .generating
         errorMessage = nil
 
-        runner.generateFromPrompt(
-            trimmed,
-            config: generationConfig,
-            onToken: { [weak self] token, isDone in
-                guard let self, let idx = self.streamingIndex else { return }
-                self.messages[idx].text += token
-                if isDone {
-                    self.messages[idx].isStreaming = false
-                    self.streamingIndex = nil
-                }
-            },
-            completion: { [weak self] _, error in
-                guard let self else { return }
-                self.modelState = .ready(info: self.runner.modelInfo ?? "")
-                if let error {
-                    self.errorMessage = error.localizedDescription
-                    // Mark the streaming bubble as done even on error
-                    if let idx = self.streamingIndex {
+        // Preprocess image on main thread (fast enough for a single 896² resize)
+        let pixelData: NSData? = image.flatMap { ImagePreprocessor.preprocess($0) }
+
+        if let pixelData, runner.isMultimodal {
+            runner.generateFromPrompt(
+                trimmed,
+                pixelData: pixelData,
+                config: generationConfig,
+                onToken: { [weak self] token, isDone in
+                    guard let self, let idx = self.streamingIndex else { return }
+                    self.messages[idx].text += token
+                    if isDone {
                         self.messages[idx].isStreaming = false
                         self.streamingIndex = nil
                     }
-                }
-            })
+                },
+                completion: { [weak self] _, error in
+                    guard let self else { return }
+                    self.modelState = .ready(info: self.runner.modelInfo ?? "")
+                    if let error {
+                        self.errorMessage = error.localizedDescription
+                        if let idx = self.streamingIndex {
+                            self.messages[idx].isStreaming = false
+                            self.streamingIndex = nil
+                        }
+                    }
+                })
+        } else {
+            runner.generateFromPrompt(
+                trimmed,
+                config: generationConfig,
+                onToken: { [weak self] token, isDone in
+                    guard let self, let idx = self.streamingIndex else { return }
+                    self.messages[idx].text += token
+                    if isDone {
+                        self.messages[idx].isStreaming = false
+                        self.streamingIndex = nil
+                    }
+                },
+                completion: { [weak self] _, error in
+                    guard let self else { return }
+                    self.modelState = .ready(info: self.runner.modelInfo ?? "")
+                    if let error {
+                        self.errorMessage = error.localizedDescription
+                        if let idx = self.streamingIndex {
+                            self.messages[idx].isStreaming = false
+                            self.streamingIndex = nil
+                        }
+                    }
+                })
+        }
     }
 
     // ---- Cancel -----------------------------------------------------------

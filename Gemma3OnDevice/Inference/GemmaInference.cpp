@@ -82,7 +82,17 @@ struct GemmaInference::Impl {
     std::unique_ptr<GemmaTokenizer> tokenizer;
 
     bool loaded     = false;
-    int  vocab_size = 262144;  // Gemma-3 default; overridden after load
+    int  vocab_size = 262208;  // Gemma-3 vocabulary; overridden by tokenizer after load
+
+    // ---- Vision encoder (optional, loaded when multimodal .pte provided) ---
+    std::unique_ptr<util::FileDataLoader>        vision_loader;
+    std::unique_ptr<Program>                     vision_program;
+    std::unique_ptr<Method>                      vision_method;
+    std::unique_ptr<util::MallocMemoryAllocator> vision_allocator;
+    std::vector<std::vector<uint8_t>>            vision_planned_buffers;
+    bool  vision_loaded = false;
+    int   hidden_dim    = 3072;   // decoder hidden size, from spec
+    int   n_image_tokens = 256;   // projected image tokens from vision encoder
 
     // ---- Sampling ----------------------------------------------------------
     std::mt19937 rng{std::random_device{}()};
@@ -97,6 +107,10 @@ GemmaInference::~GemmaInference() = default;
 
 bool GemmaInference::isLoaded() const noexcept { return impl_->loaded; }
 
+bool GemmaInference::isMultimodal() const noexcept {
+    return impl_->vision_loaded;
+}
+
 void GemmaInference::requestCancel() noexcept {
     impl_->cancel_requested.store(true, std::memory_order_relaxed);
 }
@@ -106,7 +120,8 @@ void GemmaInference::requestCancel() noexcept {
 // ---------------------------------------------------------------------------
 
 bool GemmaInference::load(const std::string& model_path,
-                           const std::string& tokenizer_path) {
+                           const std::string& tokenizer_path,
+                           const std::string& vision_encoder_path) {
     // The ExecuTorch PAL must be initialised exactly once per process.
     // runtime_init() is idempotent after the first call.
     torch::executor::runtime_init();
@@ -185,23 +200,98 @@ bool GemmaInference::load(const std::string& model_path,
     impl_->method =
         std::make_unique<Method>(std::move(method_result.get()));
 
-    // 6. Verify the method has the expected 2-input (StaticCache) signature --
-    //    input 0: input_ids      [1, 1]  int64
-    //    input 1: cache_position [1]     int64
-    //    KV-cache is mutable module state inside the .pte bundle.
+    // 6. Detect text-only (2 inputs) vs multimodal (4 inputs) signature -----
+    //    Text-only:   input_ids [1,1], cache_position [1]
+    //    Multimodal:  input_ids [1,1], cache_position [1],
+    //                 inputs_embeds [1,1,H], embed_mask [1,1,1]
     const size_t num_inputs = meta.num_inputs();
     if (num_inputs < 2) {
         ET_LOG(Error, "GemmaInference: unexpected number of method inputs: %zu",
                num_inputs);
         return false;
     }
+    const bool is_multimodal_decoder = (num_inputs >= 4);
 
     // 7. Allocate logit scratch buffer --------------------------------------
     impl_->logit_scratch.resize(static_cast<size_t>(impl_->vocab_size));
     impl_->next_cache_pos = 0;
 
     impl_->loaded = true;
-    ET_LOG(Info, "GemmaInference: loaded (vocab=%d)", impl_->vocab_size);
+    ET_LOG(Info, "GemmaInference: text decoder loaded (vocab=%d, inputs=%zu%s)",
+           impl_->vocab_size, num_inputs,
+           is_multimodal_decoder ? ", multimodal" : "");
+
+    // 8. Load vision encoder (optional) ------------------------------------
+    if (!vision_encoder_path.empty()) {
+        if (!is_multimodal_decoder) {
+            ET_LOG(Error, "GemmaInference: vision encoder provided but text "
+                   "decoder has only %zu inputs (need 4 for multimodal)", num_inputs);
+            return false;
+        }
+        if (!loadVisionEncoder(vision_encoder_path)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// loadVisionEncoder() — private helper
+// ---------------------------------------------------------------------------
+
+bool GemmaInference::loadVisionEncoder(const std::string& path) {
+    auto loader_result = util::FileDataLoader::from(
+        path.c_str(), alignof(std::max_align_t));
+    if (!loader_result.ok()) {
+        ET_LOG(Error, "GemmaInference: vision FileDataLoader failed: %s",
+               path.c_str());
+        return false;
+    }
+    impl_->vision_loader =
+        std::make_unique<util::FileDataLoader>(std::move(loader_result.get()));
+
+    auto prog_result = Program::load(
+        impl_->vision_loader.get(), Program::Verification::Minimal);
+    if (!prog_result.ok()) {
+        ET_LOG(Error, "GemmaInference: vision Program::load failed");
+        return false;
+    }
+    impl_->vision_program =
+        std::make_unique<Program>(std::move(prog_result.get()));
+
+    auto meta_result = impl_->vision_program->method_meta("forward");
+    if (!meta_result.ok()) {
+        ET_LOG(Error, "GemmaInference: vision method_meta('forward') failed");
+        return false;
+    }
+    const MethodMeta& vmeta = meta_result.get();
+
+    impl_->vision_planned_buffers.clear();
+    std::vector<Span<uint8_t>> vspans;
+    for (size_t i = 0; i < vmeta.num_memory_planned_buffers(); ++i) {
+        const size_t sz =
+            static_cast<size_t>(vmeta.memory_planned_buffer_size(i).get());
+        impl_->vision_planned_buffers.emplace_back(sz, static_cast<uint8_t>(0));
+        vspans.push_back({impl_->vision_planned_buffers.back().data(), sz});
+    }
+    HierarchicalAllocator vmem({vspans.data(), vspans.size()});
+
+    impl_->vision_allocator =
+        std::make_unique<util::MallocMemoryAllocator>();
+    MemoryManager vmm(impl_->vision_allocator.get(), &vmem);
+
+    auto vmethod_result =
+        impl_->vision_program->load_method("forward", &vmm);
+    if (!vmethod_result.ok()) {
+        ET_LOG(Error, "GemmaInference: vision load_method failed");
+        return false;
+    }
+    impl_->vision_method =
+        std::make_unique<Method>(std::move(vmethod_result.get()));
+
+    impl_->vision_loaded = true;
+    ET_LOG(Info, "GemmaInference: vision encoder loaded");
     return true;
 }
 
@@ -211,9 +301,22 @@ bool GemmaInference::load(const std::string& model_path,
 
 void GemmaInference::resetKVCache() {
     // KV-cache buffers live inside the .pte method state and are updated
-    // in-place during execute().  Resetting the position pointer is sufficient:
-    // the model's causal mask ensures positions beyond next_cache_pos are
-    // never attended to, so stale entries from a prior turn are harmless.
+    // in-place during execute().  The cache uses **fixed-size pre-allocated
+    // buffers** (StaticCache) — no torch.cat, no dynamic resizing.
+    //
+    // Indexing:  cache_index = position (linear fill, 0 … MAX_CACHE_LEN-1).
+    //
+    // True circular wrapping (position % MAX_CACHE_LEN) would introduce
+    // RoPE-position discontinuities at the wrap boundary — after wrapping,
+    // two adjacent tokens in real time can have relative-position offsets of
+    // ~MAX_CACHE_LEN instead of 1, degrading attention quality.  Because the
+    // sliding-window size equals the cache size (both 2048), a linear fill
+    // with per-turn reset provides equivalent memory guarantees without
+    // position aliasing.
+    //
+    // Resetting the position pointer is sufficient between turns: the model's
+    // causal mask ensures positions beyond next_cache_pos are never attended
+    // to, so stale entries from a prior turn are harmless.
     impl_->next_cache_pos = 0;
 }
 
@@ -221,9 +324,10 @@ void GemmaInference::resetKVCache() {
 // runStep()  — single forward step with KV-cache
 // ---------------------------------------------------------------------------
 
-Error GemmaInference::runStep(int32_t token_id,
-                               int32_t cache_pos,
-                               float*  out_logits) {
+Error GemmaInference::runStep(int32_t     token_id,
+                               int32_t     cache_pos,
+                               const void* embed_data,
+                               float*      out_logits) {
     // input_ids [1, 1]
     int64_t ids_val = static_cast<int64_t>(token_id);
     TensorImpl::SizesType   ids_sizes[2]   = {1, 1};
@@ -238,17 +342,49 @@ Error GemmaInference::runStep(int32_t token_id,
     TensorImpl pos_impl(ScalarType::Long, 1, pos_sizes, &pos_val, pos_strides);
     Tensor cache_position(&pos_impl);
 
-    // ids_impl and pos_impl are in scope for the entire function; both
-    // TensorImpl pointers remain valid through execute().
     if (auto err = impl_->method->set_input(EValue(input_ids),      0);
             err != Error::Ok) return err;
     if (auto err = impl_->method->set_input(EValue(cache_position), 1);
             err != Error::Ok) return err;
 
+    // Multimodal 4-input signature: add inputs_embeds [1,1,H] + embed_mask [1,1,1]
+    // Scratch buffers for the fp16 tensors — only used for the multimodal path.
+    std::vector<uint16_t> embed_buf;
+    uint16_t mask_val = 0;
+    if (impl_->vision_loaded) {
+        const int H = impl_->hidden_dim;
+        embed_buf.resize(static_cast<size_t>(H), 0);
+        if (embed_data) {
+            // Caller provided a float16 embedding vector — copy it in
+            std::copy(static_cast<const uint16_t*>(embed_data),
+                      static_cast<const uint16_t*>(embed_data) + H,
+                      embed_buf.data());
+            mask_val = 0x3C00;  // 1.0 in IEEE 754 half-precision
+        }
+
+        // inputs_embeds [1, 1, H] float16
+        TensorImpl::SizesType   e_sizes[3]   = {1, 1, H};
+        TensorImpl::StridesType e_strides[3] = {H, H, 1};
+        TensorImpl e_impl(ScalarType::Half, 3, e_sizes,
+                          embed_buf.data(), e_strides);
+        Tensor inputs_embeds(&e_impl);
+
+        // embed_mask [1, 1, 1] float16
+        TensorImpl::SizesType   m_sizes[3]   = {1, 1, 1};
+        TensorImpl::StridesType m_strides[3] = {1, 1, 1};
+        TensorImpl m_impl(ScalarType::Half, 3, m_sizes,
+                          &mask_val, m_strides);
+        Tensor embed_mask(&m_impl);
+
+        if (auto err = impl_->method->set_input(EValue(inputs_embeds), 2);
+                err != Error::Ok) return err;
+        if (auto err = impl_->method->set_input(EValue(embed_mask),    3);
+                err != Error::Ok) return err;
+    }
+
     if (auto err = impl_->method->execute(); err != Error::Ok) return err;
 
     // Output 0: logits [1, 1, vocab_size] — KV-cache is updated in-place
-    // inside the .pte module state; no explicit KV outputs to copy.
     const EValue& out0       = impl_->method->get_output(0);
     const float*  logits_ptr = out0.toTensor().const_data_ptr<float>();
     std::copy(logits_ptr,
@@ -256,6 +392,43 @@ Error GemmaInference::runStep(int32_t token_id,
               out_logits);
 
     return Error::Ok;
+}
+
+// ---------------------------------------------------------------------------
+// runVisionEncoder()
+// ---------------------------------------------------------------------------
+
+bool GemmaInference::runVisionEncoder(const float* pixel_data,
+                                       void*        out_embeds) {
+    if (!impl_->vision_loaded || !impl_->vision_method) return false;
+
+    // pixel_values [1, 3, 896, 896] float32
+    constexpr int C = 3, H = kVisionInputH, W = kVisionInputW;
+    TensorImpl::SizesType   pv_sizes[4]   = {1, C, H, W};
+    TensorImpl::StridesType pv_strides[4] = {C*H*W, H*W, W, 1};
+    TensorImpl pv_impl(ScalarType::Float, 4, pv_sizes,
+                       const_cast<float*>(pixel_data), pv_strides);
+    Tensor pixel_values(&pv_impl);
+
+    if (auto err = impl_->vision_method->set_input(EValue(pixel_values), 0);
+            err != Error::Ok) {
+        ET_LOG(Error, "runVisionEncoder: set_input failed");
+        return false;
+    }
+    if (auto err = impl_->vision_method->execute(); err != Error::Ok) {
+        ET_LOG(Error, "runVisionEncoder: execute failed (err %d)", (int)err);
+        return false;
+    }
+
+    // Output: projected_tokens [1, N_IMAGE_TOKENS, HIDDEN_DIM] float16
+    const EValue& vout = impl_->vision_method->get_output(0);
+    const auto& vt = vout.toTensor();
+    const size_t n_elems =
+        static_cast<size_t>(impl_->n_image_tokens) * impl_->hidden_dim;
+    std::copy(vt.const_data_ptr<uint16_t>(),
+              vt.const_data_ptr<uint16_t>() + n_elems,
+              static_cast<uint16_t*>(out_embeds));
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +466,6 @@ void GemmaInference::generate(const std::string&      prompt,
 
     for (size_t i = 0; i < prompt_tokens.size(); ++i) {
         if (impl_->next_cache_pos >= effective_max_seq) {
-            // Prompt alone fills the entire cache — abort gracefully.
             ET_LOG(Error, "generate: prompt length exceeds effective_max_seq (%d)",
                    effective_max_seq);
             if (callback) callback("", true);
@@ -301,6 +473,7 @@ void GemmaInference::generate(const std::string&      prompt,
         }
         const Error err = runStep(prompt_tokens[i],
                                   impl_->next_cache_pos,
+                                  /*embed_data=*/nullptr,
                                   logit_buf);
         if (err != Error::Ok) {
             ET_LOG(Error, "generate: prefill runStep failed at pos %d (err %d)",
@@ -312,22 +485,105 @@ void GemmaInference::generate(const std::string&      prompt,
     }
 
     // 3. Autoregressive decode loop
+    decodeLoop(logit_buf, config, callback);
+}
+
+// ---------------------------------------------------------------------------
+// generateWithImage()
+// ---------------------------------------------------------------------------
+
+void GemmaInference::generateWithImage(const std::string&      prompt,
+                                        const float*            pixel_data,
+                                        const GenerationConfig& config,
+                                        TokenCallback           callback) {
+    if (!impl_->loaded || !impl_->vision_loaded) {
+        ET_LOG(Error, "generateWithImage: model or vision encoder not loaded");
+        if (callback) callback("", true);
+        return;
+    }
+
+    resetKVCache();
+    impl_->cancel_requested.store(false, std::memory_order_relaxed);
+
+    const int H = impl_->hidden_dim;
+    const int N = impl_->n_image_tokens;
+    const int effective_max_seq = std::min(config.max_sequence_length, MAX_CACHE_LEN);
+
+    // 1. Run vision encoder → projected_tokens [N, H] float16
+    std::vector<uint16_t> vision_embeds(static_cast<size_t>(N) * H);
+    if (!runVisionEncoder(pixel_data, vision_embeds.data())) {
+        ET_LOG(Error, "generateWithImage: vision encoder failed");
+        if (callback) callback("", true);
+        return;
+    }
+
+    float* logit_buf = impl_->logit_scratch.data();
+
+    // 2. Prefill: inject vision embeddings first (N image tokens)
+    for (int i = 0; i < N; ++i) {
+        if (impl_->next_cache_pos >= effective_max_seq) {
+            ET_LOG(Error, "generateWithImage: vision tokens exceed cache");
+            if (callback) callback("", true);
+            return;
+        }
+        const uint16_t* embed_ptr = vision_embeds.data() + i * H;
+        const Error err = runStep(/*token_id=*/0,
+                                  impl_->next_cache_pos,
+                                  embed_ptr,
+                                  logit_buf);
+        if (err != Error::Ok) {
+            ET_LOG(Error, "generateWithImage: vision prefill failed at pos %d",
+                   impl_->next_cache_pos);
+            if (callback) callback("", true);
+            return;
+        }
+        ++impl_->next_cache_pos;
+    }
+
+    // 3. Prefill: text prompt tokens (after image tokens)
+    const std::vector<int32_t> prompt_tokens =
+        impl_->tokenizer->encodePrompt(prompt);
+
+    for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+        if (impl_->next_cache_pos >= effective_max_seq) {
+            ET_LOG(Error, "generateWithImage: prompt exceeds cache");
+            if (callback) callback("", true);
+            return;
+        }
+        const Error err = runStep(prompt_tokens[i],
+                                  impl_->next_cache_pos,
+                                  /*embed_data=*/nullptr,
+                                  logit_buf);
+        if (err != Error::Ok) {
+            ET_LOG(Error, "generateWithImage: text prefill failed at pos %d",
+                   impl_->next_cache_pos);
+            if (callback) callback("", true);
+            return;
+        }
+        ++impl_->next_cache_pos;
+    }
+
+    // 4. Autoregressive decode loop
+    decodeLoop(logit_buf, config, callback);
+}
+
+// ---------------------------------------------------------------------------
+// decodeLoop() — shared autoregressive decode
+// ---------------------------------------------------------------------------
+
+void GemmaInference::decodeLoop(float*                  logit_buf,
+                                 const GenerationConfig& config,
+                                 TokenCallback           callback) {
+    const int effective_max_seq = std::min(config.max_sequence_length, MAX_CACHE_LEN);
     int n_new = 0;
-    // Sample first token from last prefill logits
     int32_t next_id = sampleToken(logit_buf, impl_->vocab_size, config);
 
     while (impl_->next_cache_pos < effective_max_seq) {
 
-        // Honour a cancellation request — stop at the next token boundary
-        // so the ANE is not left mid-computation.
         if (impl_->cancel_requested.load(std::memory_order_relaxed)) {
             break;
         }
 
-        // Stop on bare EOS or Gemma-3 Instruct's <end_of_turn> (token 107).
-        // The instruct model always emits <end_of_turn> before bare EOS, so
-        // checking only eos_token_id would cause the model to run past the
-        // turn boundary and output the literal <end_of_turn> string.
         if (next_id == config.eos_token_id || next_id == kEndOfTurnTokenId) {
             if (callback) callback("", /*is_done=*/true);
             return;
@@ -345,16 +601,14 @@ void GemmaInference::generate(const std::string&      prompt,
         if (callback) callback(piece, /*is_done=*/false);
         ++n_new;
 
-        // Skip the next decode step if we've hit the token limit — avoids a
-        // wasted runStep + sampleToken whose results would be discarded.
         if (n_new >= config.max_new_tokens) break;
 
-        // Run one decode step to get logits for the NEXT token
         const Error err = runStep(next_id,
                                   impl_->next_cache_pos,
+                                  /*embed_data=*/nullptr,
                                   logit_buf);
         if (err != Error::Ok) {
-            ET_LOG(Error, "generate: decode runStep failed at pos %d (err %d)",
+            ET_LOG(Error, "decode: runStep failed at pos %d (err %d)",
                    impl_->next_cache_pos, (int)err);
             break;
         }
@@ -363,7 +617,6 @@ void GemmaInference::generate(const std::string&      prompt,
         next_id = sampleToken(logit_buf, impl_->vocab_size, config);
     }
 
-    // Reached max_new_tokens or max_sequence_length
     if (callback) callback("", /*is_done=*/true);
 }
 
@@ -457,6 +710,9 @@ std::string GemmaInference::modelInfo() const {
     std::ostringstream oss;
     oss << "Gemma-3-4B-Instruct (INT4, CoreML, StaticCache)"
         << " | vocab=" << impl_->vocab_size;
+    if (impl_->vision_loaded) {
+        oss << " | vision=" << impl_->n_image_tokens << "tok";
+    }
     return oss.str();
 }
 

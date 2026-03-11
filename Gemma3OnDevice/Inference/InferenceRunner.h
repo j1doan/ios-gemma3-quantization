@@ -49,6 +49,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Loads a Gemma-3 .pte model via FileDataLoader and runs autoregressive
 /// text generation using the ExecuTorch runtime with CoreML backend.
+/// Optionally loads a vision encoder .pte for image+text multimodal inference.
 @interface InferenceRunner : NSObject
 
 /// Designated initialiser.
@@ -56,12 +57,15 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Load the model artefacts synchronously.
 ///
-/// @param modelPath      Absolute path to gemma3_4b_int4_coreml.pte
-/// @param tokenizerPath  Absolute path to tokenizer.model
-/// @param error          Populated on failure with a descriptive string
+/// @param modelPath           Absolute path to gemma3_4b_int4_coreml.pte
+/// @param tokenizerPath       Absolute path to tokenizer.model
+/// @param visionEncoderPath   Absolute path to gemma3_vision_encoder.pte,
+///                            or nil for text-only mode.
+/// @param error               Populated on failure with a descriptive string
 /// @return YES if the model loaded successfully.
 - (BOOL)loadModelAtPath:(NSString *)modelPath
           tokenizerPath:(NSString *)tokenizerPath
+      visionEncoderPath:(nullable NSString *)visionEncoderPath
                   error:(NSError *_Nullable *_Nullable)error;
 
 /// Generate text for a user prompt, streaming each token fragment as it
@@ -80,12 +84,31 @@ NS_ASSUME_NONNULL_BEGIN
                 completion:(void(^)(NSString *fullText,
                                     NSError *_Nullable error))completion;
 
+/// Generate text for a prompt with an accompanying image.
+///
+/// @param prompt     Raw user text (chat template is applied internally).
+/// @param pixelData  Pre-processed pixel buffer as NSData containing
+///                   3*896*896 Float32 values (CHW layout, normalised).
+///                   Use ImagePreprocessor to produce this buffer.
+/// @param config     Sampling configuration.
+/// @param onToken    Called on the MAIN thread for each decoded fragment.
+/// @param completion Called on the MAIN thread once generation finishes.
+- (void)generateFromPrompt:(NSString *)prompt
+                 pixelData:(NSData *)pixelData
+                    config:(GemmaGenerationConfig *)config
+                   onToken:(void(^)(NSString *token, BOOL isDone))onToken
+                completion:(void(^)(NSString *fullText,
+                                    NSError *_Nullable error))completion;
+
 /// Cancels an in-progress generation.  The completion block will still fire
 /// with whatever text was generated up to this point.
 - (void)cancelGeneration;
 
 /// YES once -loadModel… has returned YES successfully.
 @property (nonatomic, readonly) BOOL isModelLoaded;
+
+/// YES when a vision encoder is loaded (multimodal mode).
+@property (nonatomic, readonly) BOOL isMultimodal;
 
 /// Human-readable description of the loaded model (vocab size, backend, …).
 @property (nonatomic, readonly, nullable) NSString *modelInfo;

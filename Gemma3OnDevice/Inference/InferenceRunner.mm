@@ -81,6 +81,11 @@
 }
 
 // ---------------------------------------------------------------------------
+- (BOOL)isMultimodal {
+    return _engine && _engine->isMultimodal();
+}
+
+// ---------------------------------------------------------------------------
 - (nullable NSString *)modelInfo {
     if (!_engine || !_engine->isLoaded()) return nil;
     const std::string info = _engine->modelInfo();
@@ -90,14 +95,17 @@
 // ---------------------------------------------------------------------------
 - (BOOL)loadModelAtPath:(NSString *)modelPath
           tokenizerPath:(NSString *)tokenizerPath
+      visionEncoderPath:(nullable NSString *)visionEncoderPath
                   error:(NSError **)error {
     NSParameterAssert(modelPath);
     NSParameterAssert(tokenizerPath);
 
     const std::string cppModelPath      = modelPath.UTF8String;
     const std::string cppTokenizerPath  = tokenizerPath.UTF8String;
+    const std::string cppVisionPath     = visionEncoderPath
+        ? std::string(visionEncoderPath.UTF8String) : std::string();
 
-    const bool ok = _engine->load(cppModelPath, cppTokenizerPath);
+    const bool ok = _engine->load(cppModelPath, cppTokenizerPath, cppVisionPath);
     if (!ok && error) {
         *error = [NSError
             errorWithDomain:@"GemmaInferenceErrorDomain"
@@ -181,6 +189,84 @@
                 errorWithDomain:@"GemmaInferenceErrorDomain"
                            code:102
                        userInfo:@{NSLocalizedDescriptionKey: ex.reason ?: @"Unknown error"}];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion([fullText copy], inferenceError);
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+- (void)generateFromPrompt:(NSString *)prompt
+                 pixelData:(NSData *)pixelData
+                    config:(GemmaGenerationConfig *)config
+                   onToken:(void(^)(NSString *, BOOL))onToken
+                completion:(void(^)(NSString *, NSError *))completion {
+    NSParameterAssert(prompt);
+    NSParameterAssert(pixelData);
+    NSParameterAssert(config);
+
+    if (!self.isModelLoaded || !self.isMultimodal) {
+        NSError *err = [NSError
+            errorWithDomain:@"GemmaInferenceErrorDomain"
+                       code:103
+                   userInfo:@{NSLocalizedDescriptionKey:
+                       @"Model not loaded or vision encoder not available"}];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(@"", err);
+        });
+        return;
+    }
+
+    _cancelRequested.store(false);
+
+    gemma::GenerationConfig cppConfig;
+    cppConfig.max_new_tokens      = (int)config.maxNewTokens;
+    cppConfig.temperature         = config.temperature;
+    cppConfig.top_p               = config.topP;
+    cppConfig.top_k               = (int)config.topK;
+    cppConfig.max_sequence_length = (int)config.maxSequenceLength;
+
+    const std::string cppPrompt = prompt.UTF8String;
+    // Copy pixel data pointer for use on the inference queue.
+    // pixelData is retained by the block.
+    const float* pixelPtr = (const float*)pixelData.bytes;
+
+    __block NSMutableString *fullText = [NSMutableString string];
+    __weak typeof(self) weakSelf = self;
+
+    dispatch_async(self.inferenceQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        __block NSError *inferenceError = nil;
+
+        @try {
+            strongSelf->_engine->generateWithImage(
+                cppPrompt,
+                pixelPtr,
+                cppConfig,
+                [&](const std::string& token, bool isDone) {
+                    if (strongSelf->_cancelRequested.load()) return;
+
+                    NSString *nsToken = token.empty()
+                        ? @""
+                        : [NSString stringWithUTF8String:token.c_str()];
+
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        __strong typeof(weakSelf) ss = weakSelf;
+                        if (!ss) return;
+                        if (nsToken.length > 0) [fullText appendString:nsToken];
+                        if (onToken) onToken(nsToken, isDone ? YES : NO);
+                    });
+                });
+        } @catch (NSException *ex) {
+            inferenceError = [NSError
+                errorWithDomain:@"GemmaInferenceErrorDomain"
+                           code:102
+                       userInfo:@{NSLocalizedDescriptionKey:
+                           ex.reason ?: @"Unknown error"}];
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
