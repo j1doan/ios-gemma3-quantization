@@ -1,4 +1,4 @@
-# Gemma-3 On-Device — iPhone 14 Pro (A16 Bionic)
+# Gemma-3 On-Device — Apple A16 Bionic
 
 A Swift/SwiftUI iOS application that runs **Google Gemma-3-4B-Instruct** entirely
 on-device using **ExecuTorch** with the **CoreML backend delegate**, targeting the
@@ -40,7 +40,7 @@ gemma3/
 | Tool | Version |
 |------|---------|
 | Xcode | 16.0+ |
-| iOS Deployment Target | 17.0 (CoreML backend compiled with `minimum_deployment_target="iOS17"`; iPhone 14 Pro ships iOS 16 but can be updated) |
+| iOS Deployment Target | 17.0 (CoreML backend compiled with `minimum_deployment_target="iOS17"`) |
 | Python | 3.10+ |
 | ExecuTorch | 0.4.0 |
 | CocoaPods | 1.15+ |
@@ -70,8 +70,8 @@ This produces two files in `scripts/output/`:
 | `tokenizer.model` | SentencePiece vocabulary |
 
 > **Memory note:** The INT4-quantised 4B model requires ≈ 2.0 GB of RAM for weights.
-> The static KV-cache for 2 048 tokens adds ~400 MB (fp32) on top, bringing the
-> total to ≈ 2.4 GB — within the iPhone 14 Pro's 6 GB limit with headroom for iOS.
+> The static KV-cache for 2 048 tokens adds ~272 MB (fp16) on top, bringing the
+> total to ≈ 2.3 GB — within the A16 Bionic's 6 GB unified memory limit with headroom for iOS.
 > INT4 groupwise quantization (group_size=128) keeps perplexity regression
 > manageable for a 4B-parameter model, while halving the weight footprint
 > compared to INT8.
@@ -170,10 +170,10 @@ will locate them at runtime.
 ## Step 6 — Build & run
 
 ```
-Xcode → select iPhone 14 Pro simulator or physical device → ▶ Run
+Xcode → select a physical A16 Bionic device or Simulator → ▶ Run
 ```
 
-> For **best performance**, always run on a **physical iPhone 14 Pro**.
+> For **best performance**, always run on a **physical device with an A16 Bionic SoC**.
 > The Simulator does not expose the ANE and will fall back to CPU-only
 > XNNPACK execution.
 
@@ -227,8 +227,9 @@ The exported model uses a **static KV-cache** (key/value tensors of shape
 `[1, num_kv_heads, 2048, head_dim]` allocated once at load time).  Each
 decode step processes exactly **one token** by passing `input_ids [1,1]` and
 the absolute `cache_position` scalar alongside the existing key/value state.
-The model writes updated KV tensors back as outputs, which `GemmaInference`
-copies into its in-memory cache buffers.
+The KV-cache is mutable module state inside the `.pte` bundle — it is
+updated in-place during each forward step.  No explicit KV tensors are
+passed in or out by the C++ layer; only logits are read from the output.
 
 This eliminates the O(N²) full-prefix recomputation of the original stateless
 export — each token step has constant-time cost regardless of context length.

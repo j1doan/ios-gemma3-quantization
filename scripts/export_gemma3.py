@@ -4,8 +4,8 @@ export_gemma3.py
 
 Exports Google Gemma-3-4B-Instruct to an ExecuTorch .pte file with:
   - INT4 weight-only quantization (groupwise, group_size=128) — halves the
-    weight footprint vs INT8; ~2.0 GB weights, fitting within the iPhone 14
-    Pro's 6 GB RAM alongside the KV-cache (~400 MB fp32).
+    weight footprint vs INT8; ~2.0 GB weights, fitting within the 6 GB
+    unified memory of A16 Bionic devices alongside the KV-cache (~272 MB fp16).
   - KV-cache enabled (static shape, max_cache_len = 2048 tokens) so that
     each decode step only processes one new token instead of the full prefix.
   - CoreML backend delegation for Apple Neural Engine acceleration.
@@ -88,7 +88,7 @@ class Gemma3ExportWrapper(torch.nn.Module):
             max_batch_size=1,
             max_cache_len=MAX_CACHE_LEN,
             device="cpu",
-            dtype=torch.float32,
+            dtype=torch.float16,  # fp16: matches ANE native compute, saves ~272 MB vs fp32
         )
 
     def forward(
